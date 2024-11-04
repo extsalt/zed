@@ -2559,7 +2559,7 @@ impl LocalSnapshot {
                     new_ignores.push((ancestor, None));
                 }
             }
-            if ancestor.join(*DOT_GIT).is_dir() {
+            if std::fs::metadata(&ancestor.join(*DOT_GIT)).is_ok() {
                 break;
             }
         }
@@ -3542,12 +3542,24 @@ impl BackgroundScanner {
             }
 
             let ancestor_dot_git = ancestor.join(*DOT_GIT);
-            if ancestor_dot_git.is_dir() {
+            // Check whether the directory or file called `.git` exists (in the
+            // case of worktrees it's a file.)
+            let metadata = self.fs.metadata(&ancestor_dot_git).await;
+            if let Ok(Some(metadata)) = metadata {
                 if index != 0 {
                     // We canonicalize, since the FS events use the canonicalized path.
-                    if let Some(ancestor_dot_git) =
+                    if let Some(mut ancestor_dot_git) =
                         self.fs.canonicalize(&ancestor_dot_git).await.log_err()
                     {
+                        if self.fs.is_file(ancestor_dot_git.as_ref()).await {
+                            if let Ok(git_content) = self.fs.load(&ancestor_dot_git).await {
+                                if let Some(gitdir_content) = git_content.strip_prefix("gitdir: ") {
+                                    let gitdir_path = gitdir_content.trim();
+                                    ancestor_dot_git = PathBuf::from(gitdir_path);
+                                }
+                            }
+                        }
+
                         let (ancestor_git_events, _) =
                             self.fs.watch(&ancestor_dot_git, FS_WATCH_LATENCY).await;
                         fs_events_rx = select(fs_events_rx, ancestor_git_events).boxed();
