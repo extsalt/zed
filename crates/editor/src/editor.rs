@@ -13044,12 +13044,12 @@ impl Editor {
     }
 }
 
-fn len_with_expanded_tabs(offset: usize, comment_prefix: &str, tab_size: NonZeroU32) -> usize {
+fn char_len_with_expanded_tabs(offset: usize, text: &str, tab_size: NonZeroU32) -> usize {
     let tab_size = tab_size.get() as usize;
     let mut width = offset;
 
-    for c in comment_prefix.chars() {
-        width += if c == '\t' {
+    for ch in text.chars() {
+        width += if ch == '\t' {
             tab_size - (width % tab_size)
         } else {
             1
@@ -13066,15 +13066,113 @@ mod tests {
     #[test]
     fn test_string_size_with_expanded_tabs() {
         let nz = |val| NonZeroU32::new(val).unwrap();
-        assert_eq!(len_with_expanded_tabs(0, "", nz(4)), 0);
-        assert_eq!(len_with_expanded_tabs(0, "hello", nz(4)), 5);
-        assert_eq!(len_with_expanded_tabs(0, "\thello", nz(4)), 9);
-        assert_eq!(len_with_expanded_tabs(0, "abc\tab", nz(4)), 6);
-        assert_eq!(len_with_expanded_tabs(0, "hello\t", nz(4)), 8);
-        assert_eq!(len_with_expanded_tabs(0, "\t\t", nz(8)), 16);
-        assert_eq!(len_with_expanded_tabs(0, "x\t", nz(8)), 8);
-        assert_eq!(len_with_expanded_tabs(7, "x\t", nz(8)), 9);
+        assert_eq!(char_len_with_expanded_tabs(0, "", nz(4)), 0);
+        assert_eq!(char_len_with_expanded_tabs(0, "hello", nz(4)), 5);
+        assert_eq!(char_len_with_expanded_tabs(0, "\thello", nz(4)), 9);
+        assert_eq!(char_len_with_expanded_tabs(0, "abc\tab", nz(4)), 6);
+        assert_eq!(char_len_with_expanded_tabs(0, "hello\t", nz(4)), 8);
+        assert_eq!(char_len_with_expanded_tabs(0, "\t\t", nz(8)), 16);
+        assert_eq!(char_len_with_expanded_tabs(0, "x\t", nz(8)), 8);
+        assert_eq!(char_len_with_expanded_tabs(7, "x\t", nz(8)), 9);
     }
+}
+
+/// Tokenizes a string into runs of either whitespace or non-whitespace.
+struct WhitespaceTokenizer<'a> {
+    input: &'a str,
+}
+
+impl<'a> Iterator for WhitespaceTokenizer<'a> {
+    /// Yields a span, the char length of the token, and whether it was whitespace.
+    type Item = (&'a str, usize, bool);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.input.is_empty() {
+            return None;
+        }
+
+        let mut iter = self.input.chars().peekable();
+        let mut offset = 0;
+        let mut chars = 0;
+        if let Some(first_ch) = iter.next() {
+            let is_whitespace = first_ch.is_whitespace();
+            offset += first_ch.len_utf8();
+            chars += 1;
+            while let Some(ch) = iter.peek() {
+                if ch.is_whitespace() != is_whitespace {
+                    break;
+                }
+                offset += ch.len_utf8();
+                chars += 1;
+                iter.next();
+            }
+            let token = &self.input[..offset];
+            self.input = &self.input[offset..];
+            Some((token, chars, is_whitespace))
+        } else {
+            None
+        }
+    }
+}
+
+#[test]
+fn test_tokenize_hello_world_string() {
+    let tests = vec![
+        ("", vec![]),
+        ("  ", vec![("  ", 2, true)]),
+        ("Ʒ", vec![("Ʒ", 1, false)]),
+        ("Ǽ", vec![("Ǽ", 1, false)]),
+        ("⋑", vec![("⋑", 1, false)]),
+        ("⋑⋑", vec![("⋑⋑", 2, false)]),
+        (
+            "hello world",
+            vec![("hello", 5, false), (" ", 1, true), ("world", 5, false)],
+        ),
+        (
+            "  hello world",
+            vec![
+                ("  ", 2, true),
+                ("hello", 5, false),
+                (" ", 1, true),
+                ("world", 5, false),
+            ],
+        ),
+        (
+            "这是什么 \n 钢笔",
+            vec![
+                ("这是什么", 4, false),
+                (" \n ", 3, true),
+                ("钢笔", 2, false),
+            ],
+        ),
+        (" mutton", vec![(" ", 1, true), ("mutton", 6, false)]),
+    ];
+
+    for (input, result) in tests {
+        assert_eq!(WhitespaceTokenizer { input }.collect::<Vec<_>>(), result);
+    }
+}
+
+#[test]
+fn test_wrap_with_prefix() {
+    assert_eq!(
+        wrap_with_prefix(
+            "".to_string(),
+            "\thello world".to_string(),
+            8,
+            NonZeroU32::new(4).unwrap()
+        ),
+        "hello\nworld"
+    );
+    assert_eq!(
+        wrap_with_prefix(
+            "// ".to_string(),
+            "xx \nyy zz aa bb cc".to_string(),
+            12,
+            NonZeroU32::new(4).unwrap()
+        ),
+        "// xx yy zz\n// aa bb cc"
+    );
 }
 
 fn wrap_with_prefix(
@@ -13083,23 +13181,31 @@ fn wrap_with_prefix(
     wrap_column: usize,
     tab_size: NonZeroU32,
 ) -> String {
-    let line_prefix_display_len = len_with_expanded_tabs(0, &line_prefix, tab_size);
+    let line_prefix_len = char_len_with_expanded_tabs(0, &line_prefix, tab_size);
     let mut wrapped_text = String::new();
-    let mut current_line = line_prefix.to_string();
-    let prefix_extra_chars = line_prefix_display_len - line_prefix.len();
+    let mut current_line = line_prefix.clone();
 
-    for word in unwrapped_text.split_whitespace() {
-        if current_line.len() + prefix_extra_chars + word.len() >= wrap_column {
-            wrapped_text.push_str(&current_line);
+    let tokenizer = WhitespaceTokenizer {
+        input: &unwrapped_text,
+    };
+    let mut current_line_len = line_prefix_len;
+    for (token, char_len, is_whitespace) in tokenizer {
+        if current_line_len + char_len > wrap_column {
+            wrapped_text.push_str(current_line.trim_end());
             wrapped_text.push('\n');
             current_line.truncate(line_prefix.len());
-        }
-
-        if current_line.len() > line_prefix.len() {
+            current_line_len = line_prefix_len;
+            if !is_whitespace {
+                current_line.push_str(token);
+                current_line_len += char_len;
+            }
+        } else if !is_whitespace {
+            current_line.push_str(token);
+            current_line_len += char_len;
+        } else if current_line_len != line_prefix_len {
             current_line.push(' ');
+            current_line_len += 1;
         }
-
-        current_line.push_str(word);
     }
 
     if !current_line.is_empty() {
