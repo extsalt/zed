@@ -14,7 +14,6 @@ use futures::{
         oneshot,
     },
     select_biased,
-    stream::select,
     task::Poll,
     FutureExt as _, Stream, StreamExt,
 };
@@ -2559,7 +2558,7 @@ impl LocalSnapshot {
                     new_ignores.push((ancestor, None));
                 }
             }
-            if std::fs::metadata(&ancestor.join(*DOT_GIT)).is_ok() {
+            if ancestor.join(*DOT_GIT).exists() {
                 break;
             }
         }
@@ -2930,6 +2929,12 @@ impl BackgroundScannerState {
         self.build_git_repository_for_path(work_dir_path, dot_git_path, None, fs)
     }
 
+    //          ""
+    // monorepo/.git
+    // monorepo/client/nextjs/foobar
+    // monorepo/client/nextjs/barfoo
+    //
+    // somewhereelse/foobar/.git
     fn build_git_repository_for_path(
         &mut self,
         work_dir_path: Arc<Path>,
@@ -2937,14 +2942,20 @@ impl BackgroundScannerState {
         location_in_repo: Option<Arc<Path>>,
         fs: &dyn Fs,
     ) -> Option<(RepositoryWorkDirectory, Arc<dyn GitRepository>)> {
+        dbg!("1111111111111");
+
         let work_dir_id = self
             .snapshot
             .entry_for_path(work_dir_path.clone())
             .map(|entry| entry.id)?;
 
+        dbg!("222222222222");
+
         if self.snapshot.git_repositories.get(&work_dir_id).is_some() {
             return None;
         }
+
+        dbg!("!!!!!!!!");
 
         let abs_path = self.snapshot.abs_path.join(&dot_git_path);
         let t0 = Instant::now();
@@ -2960,7 +2971,7 @@ impl BackgroundScannerState {
         }
 
         self.snapshot.repository_entries.insert(
-            work_directory.clone(),
+            work_directory.clone(), // ""
             RepositoryEntry {
                 work_directory: work_dir_id.into(),
                 branch: repository.branch_name().map(Into::into),
@@ -3544,34 +3555,27 @@ impl BackgroundScanner {
             let ancestor_dot_git = ancestor.join(*DOT_GIT);
             // Check whether the directory or file called `.git` exists (in the
             // case of worktrees it's a file.)
-            let metadata = self.fs.metadata(&ancestor_dot_git).await;
-            if let Ok(Some(metadata)) = metadata {
+            if self
+                .fs
+                .metadata(&ancestor_dot_git)
+                .await
+                .is_ok_and(|metadata| metadata.is_some())
+            {
                 if index != 0 {
                     // We canonicalize, since the FS events use the canonicalized path.
-                    if let Some(mut ancestor_dot_git) =
+                    if let Some(ancestor_dot_git) =
                         self.fs.canonicalize(&ancestor_dot_git).await.log_err()
                     {
-                        if self.fs.is_file(ancestor_dot_git.as_ref()).await {
-                            if let Ok(git_content) = self.fs.load(&ancestor_dot_git).await {
-                                if let Some(gitdir_content) = git_content.strip_prefix("gitdir: ") {
-                                    let gitdir_path = gitdir_content.trim();
-                                    ancestor_dot_git = PathBuf::from(gitdir_path);
-                                }
-                            }
+                        if self.watcher.add(&ancestor_dot_git).log_err().is_some() {
+                            // We associate the external git repo with our root folder and
+                            // also mark where in the git repo the root folder is located.
+                            self.state.lock().build_git_repository_for_path(
+                                Path::new("").into(),
+                                ancestor_dot_git.into(),
+                                Some(root_abs_path.strip_prefix(ancestor).unwrap().into()),
+                                self.fs.as_ref(),
+                            );
                         }
-
-                        let (ancestor_git_events, _) =
-                            self.fs.watch(&ancestor_dot_git, FS_WATCH_LATENCY).await;
-                        fs_events_rx = select(fs_events_rx, ancestor_git_events).boxed();
-
-                        // We associate the external git repo with our root folder and
-                        // also mark where in the git repo the root folder is located.
-                        self.state.lock().build_git_repository_for_path(
-                            Path::new("").into(),
-                            ancestor_dot_git.into(),
-                            Some(root_abs_path.strip_prefix(ancestor).unwrap().into()),
-                            self.fs.as_ref(),
-                        );
                     };
                 }
 
@@ -3710,6 +3714,7 @@ impl BackgroundScanner {
     }
 
     async fn process_events(&self, mut abs_paths: Vec<PathBuf>) {
+        dbg!(&abs_paths);
         let root_path = self.state.lock().snapshot.abs_path.clone();
         let root_canonical_path = match self.fs.canonicalize(&root_path).await {
             Ok(path) => path,
@@ -4007,10 +4012,34 @@ impl BackgroundScanner {
             let child_path: Arc<Path> = job.path.join(child_name).into();
 
             if child_name == *DOT_GIT {
-                let repo = self
-                    .state
-                    .lock()
-                    .build_git_repository(child_path.clone(), self.fs.as_ref());
+                let repo = if let Some(content) = self.fs.load(&child_abs_path).await.log_err() {
+                    if let Some(worktree_git_dir) = content.strip_prefix("gitdir: ") {
+                        let worktree_git_dir = Path::new(worktree_git_dir.trim());
+                        let git_dir = worktree_git_dir.ancestors().nth(2);
+                        if let Some(git_dir) = git_dir {
+                            println!(
+                                ">>>>>>>>>>>>>>>>>>>>>>> git_dir: {:?} <-----------------------",
+                                git_dir
+                            );
+                            self.watcher.add(git_dir).log_err();
+                            self.state.lock().build_git_repository_for_path(
+                                child_path.clone(),
+                                git_dir.into(),
+                                None,
+                                self.fs.as_ref(),
+                            )
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    self.state
+                        .lock()
+                        .build_git_repository(child_path.clone(), self.fs.as_ref())
+                };
+
                 if let Some((work_directory, repository)) = repo {
                     let t0 = Instant::now();
                     let statuses = repository
@@ -4023,6 +4052,7 @@ impl BackgroundScanner {
                         statuses,
                     });
                 }
+
                 self.watcher.add(child_abs_path.as_ref()).log_err();
             } else if child_name == *GITIGNORE {
                 match build_gitignore(&child_abs_path, self.fs.as_ref()).await {
@@ -4498,6 +4528,11 @@ impl BackgroundScanner {
         let mut repo_updates = Vec::new();
         {
             let mut state = self.state.lock();
+
+            for (entry_id, repo) in state.snapshot.git_repositories.iter() {
+                dbg!(entry_id, &repo.git_dir_path);
+            }
+
             let scan_id = state.snapshot.scan_id;
             for dot_git_dir in dot_git_paths {
                 let existing_repository_entry =
